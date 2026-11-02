@@ -13,10 +13,10 @@ use git_koi::history::AccountSnapshot;
 use git_koi::koi::derive_koi_development;
 use git_koi::motion::frame_count;
 use git_koi::output::{encode_gif, encode_png, encode_preview_html};
-use git_koi::render::{KoiFrame, render_koi, render_swim_frame};
+use git_koi::render::{KoiFrame, render_koi, render_rippled_swim_frame, render_swim_frame};
 
 const USAGE: &str = "Usage: git-koi collect LOGIN [--output FILE]
-       git-koi render SNAPSHOT --output-dir DIR [--body BODY]
+       git-koi render SNAPSHOT --output-dir DIR [--body BODY] [--ripples]
        git-koi --help | --version
 Collect LOGIN's public GitHub snapshot as JSON through `gh api`: public owned and
 contributed repositories, and daily contributions from the account's creation
@@ -26,6 +26,7 @@ Requires an authenticated GitHub CLI; in GitHub Actions, set GH_TOKEN to github.
 Render a collected SNAPSHOT into DIR: koi.gif swims the behavior chosen for its
 observation date, koi.png is the still koi, and preview.html shows both on light and
 dark backgrounds. BODY is white (the default), black, asagi, tea, gold, or platinum.
+With --ripples, the GIF swims on water that ripples around the koi.
 The files are replaced only after all of them render.
 Errors go to stderr and exit 1; invalid usage exits 2.
 Examples: git-koi collect octocat --output snapshot.json
@@ -67,8 +68,21 @@ fn main() -> ExitCode {
                 Path::new(snapshot_path),
                 Path::new(&program_arguments[3]),
                 KoiBody::default(),
+                false,
             )
         }
+        [
+            Some("render"),
+            Some(snapshot_path),
+            Some("--output-dir"),
+            _,
+            Some("--ripples"),
+        ] if !snapshot_path.starts_with('-') => run_render(
+            Path::new(snapshot_path),
+            Path::new(&program_arguments[3]),
+            KoiBody::default(),
+            true,
+        ),
         [
             Some("render"),
             Some(snapshot_path),
@@ -80,6 +94,21 @@ fn main() -> ExitCode {
             Path::new(snapshot_path),
             Path::new(&program_arguments[3]),
             parse_body(body_name).expect("the guard parsed the body"),
+            false,
+        ),
+        [
+            Some("render"),
+            Some(snapshot_path),
+            Some("--output-dir"),
+            _,
+            Some("--body"),
+            Some(body_name),
+            Some("--ripples"),
+        ] if !snapshot_path.starts_with('-') && parse_body(body_name).is_some() => run_render(
+            Path::new(snapshot_path),
+            Path::new(&program_arguments[3]),
+            parse_body(body_name).expect("the guard parsed the body"),
+            true,
         ),
         _ => {
             eprintln!("{USAGE}");
@@ -105,8 +134,13 @@ fn run_collect(login: &str, output_path: Option<&Path>) -> ExitCode {
     }
 }
 
-fn run_render(snapshot_path: &Path, output_directory: &Path, koi_body: KoiBody) -> ExitCode {
-    let render_result = render_day(snapshot_path, koi_body).and_then(|rendered_day| {
+fn run_render(
+    snapshot_path: &Path,
+    output_directory: &Path,
+    koi_body: KoiBody,
+    has_ripples: bool,
+) -> ExitCode {
+    let render_result = render_day(snapshot_path, koi_body, has_ripples).and_then(|rendered_day| {
         fs::create_dir_all(output_directory)
             .map_err(|create_error| format!("{}: {create_error}", output_directory.display()))?;
         let mut written_paths = Vec::new();
@@ -138,7 +172,11 @@ struct RenderedDay {
 }
 
 /// Render and encode the day's files in memory, so none is written unless all succeed.
-fn render_day(snapshot_path: &Path, koi_body: KoiBody) -> Result<RenderedDay, String> {
+fn render_day(
+    snapshot_path: &Path,
+    koi_body: KoiBody,
+    has_ripples: bool,
+) -> Result<RenderedDay, String> {
     let snapshot_json = fs::read_to_string(snapshot_path)
         .map_err(|read_error| format!("{}: {read_error}", snapshot_path.display()))?;
     let account_snapshot: AccountSnapshot = serde_json::from_str(&snapshot_json)
@@ -147,7 +185,13 @@ fn render_day(snapshot_path: &Path, koi_body: KoiBody) -> Result<RenderedDay, St
         .map_err(|development_error| development_error.to_string())?;
     let behavior = select_behavior(&koi_development);
     let swim_frames: Vec<KoiFrame> = (0..frame_count(behavior))
-        .map(|frame_index| render_swim_frame(&koi_development, koi_body, behavior, frame_index))
+        .map(|frame_index| {
+            if has_ripples {
+                render_rippled_swim_frame(&koi_development, koi_body, behavior, frame_index)
+            } else {
+                render_swim_frame(&koi_development, koi_body, behavior, frame_index)
+            }
+        })
         .collect();
     let gif_bytes =
         encode_gif(&swim_frames).map_err(|encoding_error| encoding_error.to_string())?;

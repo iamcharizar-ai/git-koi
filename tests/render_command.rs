@@ -9,7 +9,7 @@ use git_koi::history::{AccountSnapshot, ContributionDay};
 use git_koi::koi::{KoiDevelopment, derive_koi_development};
 use git_koi::motion::frame_count;
 use git_koi::output::{encode_gif, encode_png};
-use git_koi::render::{KoiFrame, render_koi, render_swim_frame};
+use git_koi::render::{KoiFrame, render_koi, render_rippled_swim_frame, render_swim_frame};
 
 const HISTORY_FIXTURE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -98,6 +98,37 @@ fn the_body_option_redraws_the_koi_in_that_body() {
         black_png
     );
     assert!(String::from_utf8_lossy(&command_output.stdout).contains("black body"));
+}
+
+#[test]
+fn the_ripples_option_redraws_the_loop_on_rippling_water() {
+    let output_directory = fresh_directory("render-ripples");
+    let command_output = run_git_koi(&[
+        "render",
+        HISTORY_FIXTURE,
+        "--output-dir",
+        output_directory.to_str().unwrap(),
+        "--body",
+        "gold",
+        "--ripples",
+    ]);
+    assert_eq!(
+        command_output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&command_output.stderr)
+    );
+    let koi_development = read_fixture_development();
+    let behavior = select_behavior(&koi_development);
+    let rippled_frames: Vec<KoiFrame> = (0..frame_count(behavior))
+        .map(|frame_index| {
+            render_rippled_swim_frame(&koi_development, KoiBody::Gold, behavior, frame_index)
+        })
+        .collect();
+    assert_eq!(
+        fs::read(output_directory.join("koi.gif")).unwrap(),
+        encode_gif(&rippled_frames).unwrap()
+    );
 }
 
 #[test]

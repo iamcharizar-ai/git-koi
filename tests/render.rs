@@ -10,9 +10,10 @@ use git_koi::koi::{
     RecentStreak, derive_koi_development,
 };
 use git_koi::motion::frame_count;
-use git_koi::output::encode_png;
+use git_koi::output::{encode_gif, encode_png};
 use git_koi::render::{
-    FRAME_HEIGHT_PIXELS, FRAME_WIDTH_PIXELS, KoiFrame, render_koi, render_swim_frame,
+    FRAME_HEIGHT_PIXELS, FRAME_WIDTH_PIXELS, KoiFrame, render_koi, render_rippled_swim_frame,
+    render_swim_frame,
 };
 
 type LanguageMix<'a> = &'a [(&'a str, Option<&'a str>, f64)];
@@ -553,6 +554,77 @@ fn read_fixture_development() -> KoiDevelopment {
     let account_snapshot =
         serde_json::from_str(include_str!("fixtures/account-with-history.json")).unwrap();
     derive_koi_development(&account_snapshot).unwrap()
+}
+
+#[test]
+fn ripples_never_touch_the_koi_and_keep_every_pixel_whole() {
+    let koi_development = develop_with_languages(1_500, FOUR_LANGUAGE_MIX);
+    let mut ripple_pixel_count = 0;
+    for behavior in [
+        Behavior::Cruise,
+        Behavior::Dart,
+        Behavior::Rest,
+        Behavior::DeepRest,
+    ] {
+        for frame_index in 0..frame_count(behavior) {
+            let plain_frame =
+                render_swim_frame(&koi_development, KoiBody::White, behavior, frame_index);
+            let rippled_frame =
+                render_rippled_swim_frame(&koi_development, KoiBody::White, behavior, frame_index);
+            for (plain_pixel, rippled_pixel) in plain_frame
+                .as_rgba_bytes()
+                .chunks(4)
+                .zip(rippled_frame.as_rgba_bytes().chunks(4))
+            {
+                if plain_pixel[3] != 0 {
+                    assert_eq!(plain_pixel, rippled_pixel, "{behavior:?} {frame_index}");
+                } else {
+                    assert!(matches!(rippled_pixel[3], 0 | 255));
+                    ripple_pixel_count += usize::from(rippled_pixel[3] != 0);
+                }
+            }
+        }
+    }
+    assert!(ripple_pixel_count > 0);
+}
+
+#[test]
+fn rippled_loops_wrap_around_and_encode_as_gifs() {
+    let koi_development = develop_with_languages(1_500, FOUR_LANGUAGE_MIX);
+    for behavior in [Behavior::Cruise, Behavior::Rest, Behavior::DeepRest] {
+        let loop_length = frame_count(behavior);
+        assert_eq!(
+            render_rippled_swim_frame(&koi_development, KoiBody::White, behavior, loop_length),
+            render_rippled_swim_frame(&koi_development, KoiBody::White, behavior, 0)
+        );
+        let rippled_frames: Vec<KoiFrame> = (0..loop_length)
+            .map(|frame_index| {
+                render_rippled_swim_frame(&koi_development, KoiBody::White, behavior, frame_index)
+            })
+            .collect();
+        encode_gif(&rippled_frames).unwrap();
+    }
+}
+
+#[test]
+fn ripples_leave_surface_feeding_to_its_own_rings() {
+    let koi_development = develop_with_languages(1_500, FOUR_LANGUAGE_MIX);
+    for frame_index in [0, 20, 61] {
+        assert_eq!(
+            render_rippled_swim_frame(
+                &koi_development,
+                KoiBody::White,
+                Behavior::SurfaceFeeding,
+                frame_index
+            ),
+            render_swim_frame(
+                &koi_development,
+                KoiBody::White,
+                Behavior::SurfaceFeeding,
+                frame_index
+            )
+        );
+    }
 }
 
 fn develop_with_languages(contribution_total: u64, language_mix: LanguageMix) -> KoiDevelopment {

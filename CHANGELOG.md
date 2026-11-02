@@ -6,6 +6,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `git-koi render --ripples` and `render::render_rippled_swim_frame` draw the
+  swimming koi on water that ripples: rings spread from the snout, thin out, and
+  fade, and the loop stays seamless. The Action takes a `ripples` input.
+
 ## [1.0.2] - 2026-10-31
 
 ### Fixed

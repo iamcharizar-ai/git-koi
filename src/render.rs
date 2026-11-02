@@ -65,6 +65,7 @@ pub fn render_koi(koi_development: &KoiDevelopment, koi_body: KoiBody) -> KoiFra
         &koi_anatomy,
         &STILL_POSE,
         Framing::CenterOnKoi,
+        None,
     )
 }
 
@@ -82,25 +83,66 @@ pub fn render_swim_frame(
     behavior: Behavior,
     frame_index: u32,
 ) -> KoiFrame {
+    render_loop_frame(koi_development, koi_body, behavior, frame_index, false)
+}
+
+/// Render one frame of a behavior's loop like `render_swim_frame`, on water that
+/// ripples. Every so often the koi's snout stirs the surface, and two rings spread from
+/// that spot, thin out, and fade. They stay where they started while the koi swims on,
+/// and they are drawn only on empty pixels, so the koi is exactly the koi
+/// `render_swim_frame` draws. The rings wrap around the loop with the koi, so the loop
+/// stays seamless. Surface feeding already ripples, so it draws the same frames as
+/// `render_swim_frame`. Identical inputs produce identical pixels without I/O, clock
+/// reads, or input mutation.
+pub fn render_rippled_swim_frame(
+    koi_development: &KoiDevelopment,
+    koi_body: KoiBody,
+    behavior: Behavior,
+    frame_index: u32,
+) -> KoiFrame {
+    render_loop_frame(koi_development, koi_body, behavior, frame_index, true)
+}
+
+fn render_loop_frame(
+    koi_development: &KoiDevelopment,
+    koi_body: KoiBody,
+    behavior: Behavior,
+    frame_index: u32,
+    has_ripples: bool,
+) -> KoiFrame {
     let koi_anatomy = calculate_anatomy(koi_development.total_contributions);
     let swim_pose = calculate_swim_pose(behavior, frame_index);
-    let pose_center = match swim_pose.course {
-        Course::Lap { .. } => [0.0, 0.0],
-        Course::Hover { drift_pixels, .. } => {
-            let hover_fit = fit_hover_loop(behavior, &koi_anatomy);
-            [0, 1].map(|axis_index| {
-                hover_fit.sweep_center[axis_index]
-                    - hover_fit.drift_scales[axis_index] * drift_pixels[axis_index]
-            })
-        }
-    };
+    let pose_center = calculate_loop_pose_center(behavior, &koi_anatomy, &swim_pose);
     render_pose(
         koi_development,
         koi_body,
         &koi_anatomy,
         &swim_pose,
         Framing::At(pose_center),
+        has_ripples.then_some(RippleLoop {
+            behavior,
+            frame_index,
+        }),
     )
+}
+
+/// The point a loop's view is fixed on in one frame: the frame center for laps, and the
+/// hover loop's sweep center less the fitted drift for hovering.
+fn calculate_loop_pose_center(
+    behavior: Behavior,
+    koi_anatomy: &KoiAnatomy,
+    swim_pose: &SwimPose,
+) -> [f64; 2] {
+    match swim_pose.course {
+        Course::Lap { .. } => [0.0, 0.0],
+        Course::Hover { drift_pixels, .. } => {
+            let hover_fit = fit_hover_loop(behavior, koi_anatomy);
+            [0, 1].map(|axis_index| {
+                hover_fit.sweep_center[axis_index]
+                    - hover_fit.drift_scales[axis_index] * drift_pixels[axis_index]
+            })
+        }
+    }
 }
 
 /// Where the view is centered: on the koi itself for the still image, or at a point
@@ -188,6 +230,7 @@ fn render_pose(
     koi_anatomy: &KoiAnatomy,
     swim_pose: &SwimPose,
     framing: Framing,
+    ripple_loop: Option<RippleLoop>,
 ) -> KoiFrame {
     let koi_coat = KoiCoat::new(koi_development, koi_body, |along_fraction| {
         calculate_body_half_width(along_fraction, koi_anatomy)
@@ -257,6 +300,9 @@ fn render_pose(
     }
     if swim_pose.depth > 0.0 {
         paint_depth(&mut rgba_pixels, &fish_pixel_mask, swim_pose.depth);
+    }
+    if let Some(ripple_loop) = ripple_loop {
+        paint_ripples(&mut rgba_pixels, koi_anatomy, ripple_loop, pose_center);
     }
     KoiFrame { rgba_pixels }
 }
@@ -426,6 +472,115 @@ fn paint_feeding(
             PELLET_COLORS[1],
             1.0,
         );
+    }
+}
+
+/// A frame of a behavior's loop, which the ripples need to know where they are in.
+#[derive(Clone, Copy)]
+struct RippleLoop {
+    behavior: Behavior,
+    frame_index: u32,
+}
+
+/// Ripples on the water around the koi. Each spawn spot is the snout in a frame spread
+/// evenly around the loop, about one every thirty frames. From its spot a ring widens,
+/// with a second ring following inside it, and both thin out as they fade. Every ring
+/// is painted only on an empty pixel, so the koi is never covered, and where the frame
+/// edge leaves too little room a ring spreads less far instead of running off.
+fn paint_ripples(
+    rgba_pixels: &mut [[u8; 4]],
+    koi_anatomy: &KoiAnatomy,
+    ripple_loop: RippleLoop,
+    pose_center: [f64; 2],
+) {
+    const RIPPLE_SPAWN_FRAMES: u32 = 30;
+    const RIPPLE_LIFE_FRAMES: u32 = 56;
+    const REACH_PER_BODY_LENGTH: f64 = 0.62;
+    const START_RADIUS_PIXELS: f64 = 2.0;
+    const RING_WIDTH_PIXELS: f64 = 1.3;
+    const INNER_RING_SHARE: f64 = 0.62;
+    // The inner ring waits for the outer ring to open before it shows.
+    const INNER_RING_DELAY: f64 = 0.12;
+    const INNER_RING_STRENGTH: f64 = 0.8;
+    const FADE_EXPONENT: f64 = 1.5;
+    const OUTER_RING_COLOR: [u8; 4] = [92, 168, 222, 255];
+    const INNER_RING_COLOR: [u8; 4] = [150, 203, 238, 255];
+    // A clear pixel between a ring and the frame edge, plus rounding.
+    const EDGE_MARGIN_PIXELS: f64 = 2.0;
+    let RippleLoop {
+        behavior,
+        frame_index,
+    } = ripple_loop;
+    // Surface feeding draws its own rings.
+    if behavior == Behavior::SurfaceFeeding {
+        return;
+    }
+    let frame_sizes = [
+        f64::from(FRAME_WIDTH_PIXELS),
+        f64::from(FRAME_HEIGHT_PIXELS),
+    ];
+    let loop_frames = frame_count(behavior);
+    let loop_frame = frame_index % loop_frames;
+    let life_frames = RIPPLE_LIFE_FRAMES.min(loop_frames);
+    let spawn_count = (loop_frames / RIPPLE_SPAWN_FRAMES).max(1);
+    let frame_width = FRAME_WIDTH_PIXELS as usize;
+    let frame_height = FRAME_HEIGHT_PIXELS as usize;
+    let mut paint_ring = |center: [f64; 2], radius: f64, color: [u8; 4], strength: f64| {
+        let half_width = RING_WIDTH_PIXELS / 2.0;
+        let reach = radius + half_width + 1.0;
+        let first_y = (center[1] - reach).floor().max(0.0) as usize;
+        let last_y = ((center[1] + reach).ceil().max(0.0) as usize).min(frame_height - 1);
+        let first_x = (center[0] - reach).floor().max(0.0) as usize;
+        let last_x = ((center[0] + reach).ceil().max(0.0) as usize).min(frame_width - 1);
+        for pixel_y in first_y..=last_y {
+            for pixel_x in first_x..=last_x {
+                let distance_pixels =
+                    (pixel_x as f64 + 0.5 - center[0]).hypot(pixel_y as f64 + 0.5 - center[1]);
+                let pixel_index = pixel_y * frame_width + pixel_x;
+                if (distance_pixels - radius).abs() <= half_width
+                    && rgba_pixels[pixel_index][3] == 0
+                    && calculate_dither_threshold([pixel_x as u32, pixel_y as u32]) < strength
+                {
+                    rgba_pixels[pixel_index] = color;
+                }
+            }
+        }
+    };
+    for spawn_index in 0..spawn_count {
+        let spawn_frame = spawn_index * loop_frames / spawn_count;
+        let age_frames = (loop_frame + loop_frames - spawn_frame) % loop_frames;
+        if age_frames >= life_frames {
+            continue;
+        }
+        let life = f64::from(age_frames) / f64::from(life_frames);
+        let spawn_spine = build_spine(koi_anatomy, &calculate_swim_pose(behavior, spawn_frame));
+        let spawn_world = calculate_mouth_position(&spawn_spine);
+        let center = [0, 1].map(|axis_index| {
+            spawn_world[axis_index] - pose_center[axis_index] + frame_sizes[axis_index] / 2.0
+        });
+        let room = [0, 1]
+            .map(|axis_index| {
+                center[axis_index].min(frame_sizes[axis_index] - center[axis_index])
+                    - EDGE_MARGIN_PIXELS
+            })
+            .into_iter()
+            .fold(f64::INFINITY, f64::min);
+        let widest_radius = (koi_anatomy.body_length_pixels * REACH_PER_BODY_LENGTH).min(room);
+        if widest_radius <= START_RADIUS_PIXELS {
+            continue;
+        }
+        let spread = 1.0 - (1.0 - life).powi(2);
+        let radius = START_RADIUS_PIXELS + (widest_radius - START_RADIUS_PIXELS) * spread;
+        let strength = (1.0 - life).powf(FADE_EXPONENT);
+        paint_ring(center, radius, OUTER_RING_COLOR, strength);
+        if life > INNER_RING_DELAY {
+            paint_ring(
+                center,
+                radius * INNER_RING_SHARE,
+                INNER_RING_COLOR,
+                strength * INNER_RING_STRENGTH,
+            );
+        }
     }
 }
 
